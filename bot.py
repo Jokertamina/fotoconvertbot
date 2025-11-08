@@ -123,6 +123,7 @@ class AlbumBuffer:
     message_ids: List[int] = field(default_factory=list)
     items: List[bytes] = field(default_factory=list)  # webp bytes
     last_update: float = field(default_factory=lambda: time.time())
+    finalized: bool = False  # evita doble finalización y limpieza prematura
 
 ALBUMS: Dict[str, AlbumBuffer] = {}
 FINALIZE_TASKS: Dict[str, asyncio.Task] = {}
@@ -253,13 +254,19 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if task := FINALIZE_TASKS.get(mgid):
         task.cancel()
+
     async def _debounce_finalize():
+        finalized_local = False
         try:
             await asyncio.sleep(ALBUM_TTL_SEC)
-            if mgid in ALBUMS and (time.time() - ALBUMS[mgid].last_update) >= (ALBUM_TTL_SEC - 0.1):
+            album_ref = ALBUMS.get(mgid)
+            if album_ref and (not album_ref.finalized) and (time.time() - album_ref.last_update) >= (ALBUM_TTL_SEC - 0.1):
+                album_ref.finalized = True
+                finalized_local = True
                 draft_id = str(uuid.uuid4())
-                await finalize_and_send(draft_id, ALBUMS[mgid], msg)
+                await finalize_and_send(draft_id, album_ref, msg)
         except asyncio.CancelledError:
+            # Se canceló por llegada de nueva parte del álbum: no limpiar estado
             pass
         except Exception as e:
             log.exception("Error finalizando álbum")
@@ -268,9 +275,13 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         finally:
-            ALBUMS.pop(mgid, None)
             FINALIZE_TASKS.pop(mgid, None)
-    FINALIZE_TASKS[mgid] = context.application.create_task(_debounce_finalize())
+            if finalized_local:
+                ALBUMS.pop(mgid, None)
+
+    # Solo programa si el álbum no ha sido finalizado ya
+    if not ALBUMS[mgid].finalized:
+        FINALIZE_TASKS[mgid] = context.application.create_task(_debounce_finalize())
 
 def main():
     app = (
