@@ -20,6 +20,7 @@ from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
     ContextTypes, filters
 )
+from telegram.error import TimedOut, NetworkError, RetryAfter, Conflict
 
 # HTTP async
 import aiohttp
@@ -37,39 +38,38 @@ TARGET_KB = int(os.getenv("TARGET_KB", "200"))
 MAX_DIM = int(os.getenv("MAX_DIMENSION", "1920"))
 MIN_Q, MAX_Q = 30, 90
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID", "0"))  # grupo permitido (opcional)
+ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID", "0"))
 ALBUM_TTL_SEC = float(os.getenv("ALBUM_TTL_SEC", "4.0"))
 
 API_DRAFTS_IMPORT_URL = os.getenv("API_DRAFTS_IMPORT_URL", "https://www.morrinashop.com/api/drafts/import")
-X_INGEST_TOKEN = os.getenv("X_INGEST_TOKEN")
+X_INGEST_TOKEN = os.getenv("X_INGEST_TOKEN") or os.getenv("INGEST_TOKEN")
 if not X_INGEST_TOKEN:
-    raise SystemExit("Falta X_INGEST_TOKEN (mismo valor que INGEST_TOKEN en la web)")
+    raise SystemExit("Falta X_INGEST_TOKEN/INGEST_TOKEN (mismo valor que INGEST_TOKEN en la web)")
 if not API_DRAFTS_IMPORT_URL:
     raise SystemExit("Falta API_DRAFTS_IMPORT_URL")
 
-# Firebase/GCS
-FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
-FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET")
+# Firebase/GCS (acepta nombres 'NEXT_PUBLIC_*' por comodidad)
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID") or os.getenv("NEXT_PUBLIC_FIREBASE_PROJECT_ID")
+FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET") or os.getenv("NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET")
 SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
 if not (FIREBASE_PROJECT_ID and FIREBASE_STORAGE_BUCKET and SERVICE_ACCOUNT_JSON):
-    raise SystemExit("Faltan FIREBASE_PROJECT_ID, FIREBASE_STORAGE_BUCKET o SERVICE_ACCOUNT_JSON")
+    raise SystemExit("Faltan FIREBASE_PROJECT_ID/NEXT_PUBLIC_FIREBASE_PROJECT_ID, "
+                     "FIREBASE_STORAGE_BUCKET/NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET o SERVICE_ACCOUNT_JSON")
 
 creds = service_account.Credentials.from_service_account_info(json.loads(SERVICE_ACCOUNT_JSON))
 gcs_client = gcs.Client(project=FIREBASE_PROJECT_ID, credentials=creds)
 bucket = gcs_client.bucket(FIREBASE_STORAGE_BUCKET)
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO
-)
-# Silenciar ruido de polling httpx
+logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.INFO)
 logging.getLogger("telegram.ext").setLevel(logging.INFO)
-
 log = logging.getLogger("ingest-bot")
 START_TIME = datetime.now(timezone.utc)
 stats = {"processed": 0, "saved_bytes": 0}
+
+# Log de configuración efectiva
+log.info(f"GCP Project={FIREBASE_PROJECT_ID}, Bucket={FIREBASE_STORAGE_BUCKET}, SA={creds.service_account_email}")
 
 # -------- Utilidades --------
 async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -114,8 +114,7 @@ def to_webp_optimized(img_bytes: bytes, target_kb: int, max_dim: int) -> Tuple[i
     best_buf.seek(0)
     return best_buf, best_q
 
-# -------- Álbumes (agrupación por media_group_id) --------
-from dataclasses import dataclass, field
+# -------- Álbumes --------
 @dataclass
 class AlbumBuffer:
     media_group_id: str
@@ -167,6 +166,7 @@ async def finalize_and_send(draft_id: str, album: AlbumBuffer, reply_target):
                 data = {}
             draft_id_resp = data.get("draftId", draft_id)
             slug_suggested = data.get("slugSuggested")
+
     await reply_target.reply_text(
         f"📝 Borrador creado: {draft_id_resp}\n"
         f"Slug sugerido: {slug_suggested or '—'}\n"
@@ -251,7 +251,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     album.items.append(webp_buf.getvalue())
     log.info(f"Imagen añadida mgid={mgid} q={used_q} size~{after//1024}KB total={len(album.items)}")
 
-    # Debounce: si ya hay una tarea, cancélala y programa otra
     if task := FINALIZE_TASKS.get(mgid):
         task.cancel()
     async def _debounce_finalize():
@@ -277,11 +276,8 @@ def main():
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .connect_timeout(30)
-        .read_timeout(60)
-        .write_timeout(60)
-        .pool_timeout(30)
-        .get_updates_read_timeout(70)
+        .connect_timeout(30).read_timeout(60).write_timeout(60)
+        .pool_timeout(30).get_updates_read_timeout(70)
         .build()
     )
     app.add_handler(CommandHandler("start", start))
@@ -290,8 +286,27 @@ def main():
     app.add_handler(CommandHandler("setmaxdim", setmaxdim))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media))
-    log.info("Bot iniciado. Esperando álbumes…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    backoff = 5
+    while True:
+        try:
+            log.info("Bot iniciado. Esperando álbumes…")
+            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+            break
+        except RetryAfter as e:
+            wait = int(getattr(e, "retry_after", backoff)) + 1
+            log.warning(f"RetryAfter {wait}s")
+            time.sleep(wait)
+        except (TimedOut, NetworkError) as e:
+            log.warning(f"Timeout/NetworkError: {e}. Reintentando en {backoff}s…")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        except Conflict:
+            log.warning("Otra instancia en ejecución. Reintentando en 30s…")
+            time.sleep(30)
+        except Exception:
+            log.exception("Error inesperado. Reintento en 15s…")
+            time.sleep(15)
 
 if __name__ == "__main__":
     main()
