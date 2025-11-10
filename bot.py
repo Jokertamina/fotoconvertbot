@@ -283,7 +283,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ALBUMS[mgid].finalized:
         FINALIZE_TASKS[mgid] = context.application.create_task(_debounce_finalize())
 
-def main():
+def build_app():
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -297,12 +297,16 @@ def main():
     app.add_handler(CommandHandler("setmaxdim", setmaxdim))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media))
+    return app
 
+def main():
     backoff = 5
     while True:
+        app = build_app()
         try:
             log.info("Bot iniciado. Esperando álbumes…")
-            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+            # stop_signals=None evita registrar signal handlers sobre un loop ya cerrado en reintentos
+            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, stop_signals=None)
             break
         except RetryAfter as e:
             wait = int(getattr(e, "retry_after", backoff)) + 1
